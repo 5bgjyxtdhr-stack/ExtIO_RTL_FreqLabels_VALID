@@ -1,14 +1,19 @@
+
 @echo off
-call "%ProgramFiles(x86)%\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x86 || call "%ProgramFiles%\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x86
-setlocal ENABLEDELAYEDEXPANSION
+setlocal
+call "%ProgramFiles(x86)%\Microsoft Visual Studio\2019\BuildTools\VC\Auxiliary\Build\vcvarsall.bat" x86
 
-rem Build 32-bit DLL with explicit .def exports and machine x86
-cl /nologo /EHsc /MD /O2 /DWIN32 /D_WINDOWS /D_USRDLL /D_WINDLL /DWINRAD_EXTIO /I. ^
-  ExtIO_RTL_FreqLabels.cpp ^
-  /link /DLL /OUT:ExtIO_RTL_FreqLabels.dll /DEF:ExtIO_RTL_FreqLabels.def /MACHINE:X86
+if not exist build mkdir build
 
-if %ERRORLEVEL% NEQ 0 exit /b %ERRORLEVEL%
+cl /nologo /EHsc /MD /O2 ^
+  /DWIN32 /D_WINDOWS ^
+  /Fe:build\ExtIO_RTL_FreqLabels.obj ^
+  /c src\ExtIO_RTL_FreqLabels.cpp
 
-mkdir artifacts 2>nul
-copy ExtIO_RTL_FreqLabels.dll artifacts\
-if exist freq_labels.csv copy freq_labels.csv artifacts\
+link /nologo /DLL ^
+  /DEF:res\ExtIO_RTL_FreqLabels.def ^
+  /OUT:build\ExtIO_RTL_FreqLabels.dll ^
+  build\ExtIO_RTL_FreqLabels.obj
+
+echo Done: build\ExtIO_RTL_FreqLabels.dll
+endlocal

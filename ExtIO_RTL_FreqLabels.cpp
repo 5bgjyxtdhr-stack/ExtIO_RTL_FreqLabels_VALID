@@ -16,6 +16,15 @@ static void copy_str(char* dst, const char* src, int maxLen)
     int i=0; for (; i<maxLen-1 && src[i]; ++i) dst[i]=src[i]; dst[i]='\0';
 }
 
+// ... existujúci kód hore ...
+
+__declspec(dllexport) long __stdcall GetHWSR(void)
+{
+    // Dočasne vrátime pevnú hodnotu – typicky 2.4 MS/s pre RTL-SDR
+    return 2400000; // Hz
+}
+
+
 __declspec(dllexport) bool __stdcall InitHW(char* name, char* model, int& type)
 {
     // Short names recommended by spec (will appear in HDSDR menu)

@@ -1,28 +1,21 @@
 
-name: build-extio
-on:
-  push:
-  workflow_dispatch:
-
-jobs:
-  build:
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Setup MSVC dev cmd
-        uses: ilammy/msvc-dev-cmd@v1
-      - name: Build DLL (x86)
-        shell: cmd
-        run: build.bat
-      - name: Verify PE architecture
+      - name: Prepare dist
         shell: pwsh
         run: |
-          $p = 'ExtIO_RTL_FreqLabels.dll'
-          $sig = (Get-Item $p).VersionInfo
-          Write-Host "File: $p"
-          & dumpbin /headers $p | Select-String -Pattern "machine \(x86\)|machine \(x64\)|PE32|PE32\+"
-      - name: Upload artifact
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item build\ExtIO_RTL_FreqLabels.dll dist/
+          Copy-Item freq_labels.csv dist/
+
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: ExtIO_RTL_FreqLabels-x86
-          path: artifacts/*
+          name: ExtIO_RTL_FreqLabels
+          path: dist
+
+# (pri tagu) release s DLL + CSV
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/ExtIO_RTL_FreqLabels.dll
+            dist/freq_labels.csv

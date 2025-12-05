@@ -9,7 +9,7 @@ EXPORTS
     SetCallback=_SetCallback@4
     SetHWLO=_SetHWLO@4
     GetHWLO=_GetHWLO@0
-    GetHWSR=_GetHWSR@0     ; <— NOVÉ
+    GetHWSR=_GetHWSR@0
     GetStatus=_GetStatus@0
     ShowGUI=_ShowGUI@0
     TuneChanged=_TuneChanged@4

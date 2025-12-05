@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cctype>
+#include <cmath>     // llround
 
 #include <windows.h>
 #pragma comment(lib, "user32.lib")
@@ -43,6 +44,32 @@ static void copy_str(char* dst, const char* src, int maxLen)
     int i = 0;
     for (; i < maxLen - 1 && src[i] != '\0'; ++i) dst[i] = src[i];
     dst[i] = '\0';
+}
+
+
+// Prevedie reťazec na frekvenciu v Hz.
+// Ak je hodnota < 10000 => berieme to ako MHz a násobíme *1e6.
+// Ak obsahuje čiarku, prekonvertujeme ju na bodku.
+static long parse_freq_to_hz(const char* s)
+{
+    if (!s || !*s) return 0;
+    char buf[64];
+    std::size_t n = std::min(std::strlen(s), sizeof(buf)-1);
+    std::memcpy(buf, s, n); buf[n] = '\0';
+
+    // nahradiť , -> . (EUR formát desatinných miest)
+    for (char* p = buf; *p; ++p) if (*p == ',') *p = '.';
+
+    double v = 0.0;
+    if (std::sscanf(buf, "%lf", &v) != 1) return 0;
+
+    if (v < 10000.0) {
+        // pravdepodobne MHz
+        return (long)std::llround(v * 1e6);
+    } else {
+        // pravdepodobne Hz
+        return (long)std::llround(v);
+    }
 }
 
 static char* trim(char* s)

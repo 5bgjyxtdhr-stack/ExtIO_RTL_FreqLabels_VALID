@@ -130,9 +130,10 @@ static bool load_csv_labels()
         size_t ln = std::strlen(nstr);
         while (ln && (nstr[ln - 1] == '\r' || nstr[ln - 1] == '\n')) { nstr[--ln] = '\0'; }
 
-        long hz = 0;
-        if (std::sscanf(fstr, "%ld", &hz) != 1) continue;
-        if (hz <= 0) continue;
+        
+long hz = parse_freq_to_hz(fstr);
+if (hz <= 0) continue;
+
 
         g_table[g_table_count].hz = hz;
         copy_str(g_table[g_table_count].name, nstr, (int)sizeof(g_table[g_table_count].name));
@@ -237,7 +238,13 @@ static void ensure_gui()
 static void refresh_gui_label()
 {
     if (g_hwnd && g_hLabel && IsWindow(g_hLabel)) {
-        set_label_text(g_hLabel, g_last_label);
+        
+char msg[256];
+std::snprintf(msg, sizeof(msg),
+    (g_last_label[0] ? "%s" : "no match (LO=%ld Hz, rows=%d)"),
+    g_last_label, g_lo, g_table_count);
+set_label_text(g_hLabel, msg);
+
     }
 }
 

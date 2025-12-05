@@ -1,7 +1,6 @@
 
-// ExtIO RTL-FreqLabels: CSV lookup (±10 kHz) + jednoduché GUI okno so statickým textom
-// Rozhranie Winrad/ExtIO: extern "C", __stdcall, __declspec(dllexport)
-
+// ExtIO RTL-FreqLabels: CSV lookup (±100 kHz) + jednoduché GUI so statickým textom
+// Rozhranie Winrad/ExtIO (HDSDR-kompatibilné): extern "C", __stdcall, __declspec(dllexport)
 
 #include <cstdio>
 #include <cstdlib>
@@ -11,11 +10,13 @@
 #include <algorithm>
 
 #ifndef NOMINMAX
-#define NOMINMAX   // zabráni makrám min/max z windows.h rozbiť std::min/std::max
+#define NOMINMAX   // zabráni makrám min/max z <windows.h> rozbiť std::min/std::max
 #endif
 #include <windows.h>
 #pragma comment(lib, "user32.lib")
 
+#define NAME_MAX   64
+#define MODEL_MAX  64
 
 extern "C" {
 
@@ -32,8 +33,13 @@ struct FreqName { long hz; char name[128]; };
 static FreqName* g_table = nullptr;
 static int       g_table_count = 0;
 
-static const long TOL_HZ = 10000;            // ±10 kHz
+// Tolerancia pre zhodu (±100 kHz)
+static const long TOL_HZ = 100000;
+
+// Posledný nájdený názov + diagnostika
 static char g_last_label[128] = {0};
+static long g_last_tune  = 0;   // posledná TUNE frekvencia
+static long g_last_match = 0;   // frekvencia nájdená v tabuľke (Hz)
 
 // GUI
 static HWND g_hwnd   = nullptr;              // hlavné okno pluginu
@@ -49,6 +55,15 @@ static void copy_str(char* dst, const char* src, int maxLen)
     dst[i] = '\0';
 }
 
+static char* trim(char* s)
+{
+    if (!s) return s;
+    while (*s && std::isspace((unsigned char)*s)) ++s;
+    if (!*s) return s;
+    char* e = s + std::strlen(s) - 1;
+    while (e > s && std::isspace((unsigned char)*e)) { *e = '\0'; --e; }
+    return s;
+}
 
 // Prevedie reťazec na frekvenciu v Hz.
 // Ak je hodnota < 10000 => berieme to ako MHz a násobíme *1e6.
@@ -57,15 +72,10 @@ static long parse_freq_to_hz(const char* s)
 {
     if (!s || !*s) return 0;
     char buf[64];
-    
-// namiesto: std::size_t n = std::min(std::strlen(s), sizeof(buf)-1);
-std::size_t sl = std::strlen(s);
-std::size_t n  = (sl < sizeof(buf)-1 ? sl : sizeof(buf)-1);
-std::memcpy(buf, s, n); buf[n] = '\0';
-
+    std::size_t sl = std::strlen(s);
+    std::size_t n  = (sl < sizeof(buf)-1 ? sl : sizeof(buf)-1);
     std::memcpy(buf, s, n); buf[n] = '\0';
 
-    // nahradiť , -> . (EUR formát desatinných miest)
     for (char* p = buf; *p; ++p) if (*p == ',') *p = '.';
 
     double v = 0.0;
@@ -78,16 +88,6 @@ std::memcpy(buf, s, n); buf[n] = '\0';
         // pravdepodobne Hz
         return (long)std::llround(v);
     }
-}
-
-static char* trim(char* s)
-{
-    if (!s) return s;
-    while (*s && std::isspace((unsigned char)*s)) ++s;
-    if (!*s) return s;
-    char* e = s + std::strlen(s) - 1;
-    while (e > s && std::isspace((unsigned char)*e)) { *e = '\0'; --e; }
-    return s;
 }
 
 static bool load_csv_labels()
@@ -138,10 +138,8 @@ static bool load_csv_labels()
         size_t ln = std::strlen(nstr);
         while (ln && (nstr[ln - 1] == '\r' || nstr[ln - 1] == '\n')) { nstr[--ln] = '\0'; }
 
-        
-long hz = parse_freq_to_hz(fstr);
-if (hz <= 0) continue;
-
+        long hz = parse_freq_to_hz(fstr);
+        if (hz <= 0) continue;
 
         g_table[g_table_count].hz = hz;
         copy_str(g_table[g_table_count].name, nstr, (int)sizeof(g_table[g_table_count].name));
@@ -153,19 +151,31 @@ if (hz <= 0) continue;
 
 static const char* find_label_for(long hz)
 {
+    g_last_match = 0;
     if (!g_table || g_table_count <= 0) return nullptr;
 
-    // presná zhoda
-    for (int i = 0; i < g_table_count; ++i)
-        if (g_table[i].hz == hz) return g_table[i].name;
-
-    // v tolerancii ±TOL_HZ (krok 100 Hz)
+    // 1) presná zhoda
+    for (int i = 0; i < g_table_count; ++i) {
+        if (g_table[i].hz == hz) { g_last_match = g_table[i].hz; return g_table[i].name; }
+    }
+    // 2) ± tolerancia (krok 100 Hz)
     for (long d = 0; d <= TOL_HZ; d += 100) {
         long f1 = hz + d, f2 = hz - d;
         for (int i = 0; i < g_table_count; ++i) {
-            if (g_table[i].hz == f1) return g_table[i].name;
-            if (g_table[i].hz == f2) return g_table[i].name;
+            if (g_table[i].hz == f1) { g_last_match = g_table[i].hz; return g_table[i].name; }
+            if (g_table[i].hz == f2) { g_last_match = g_table[i].hz; return g_table[i].name; }
         }
+    }
+    // 3) najbližšia zhoda v rámci ± TOL_HZ
+    long bestDelta = TOL_HZ + 1;
+    int bestIdx = -1;
+    for (int i = 0; i < g_table_count; ++i) {
+        long d = std::labs(g_table[i].hz - hz);
+        if (d < bestDelta) { bestDelta = d; bestIdx = i; }
+    }
+    if (bestIdx >= 0 && bestDelta <= TOL_HZ) {
+        g_last_match = g_table[bestIdx].hz;
+        return g_table[bestIdx].name;
     }
     return nullptr;
 }
@@ -200,9 +210,8 @@ static LRESULT CALLBACK GuiWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lP
         g_hLabel = CreateWindowExW(
             0, L"STATIC", L"",
             WS_CHILD | WS_VISIBLE | SS_LEFT,
-            10, 10, 360, 24,
+            10, 10, 560, 28,
             hwnd, (HMENU)1, (HINSTANCE)GetWindowLongPtr(hwnd, GWLP_HINSTANCE), nullptr);
-        set_label_text(g_hLabel, g_last_label);
         return 0;
 
     case WM_CLOSE:
@@ -234,7 +243,7 @@ static void ensure_gui()
     g_hwnd = CreateWindowExW(
         WS_EX_TOOLWINDOW, wc.lpszClassName, L"ExtIO RTL-FreqLabels",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
-        CW_USEDEFAULT, CW_USEDEFAULT, 420, 120,
+        CW_USEDEFAULT, CW_USEDEFAULT, 640, 140,
         nullptr, nullptr, wc.hInstance, nullptr);
 
     if (g_hwnd) {
@@ -245,15 +254,21 @@ static void ensure_gui()
 
 static void refresh_gui_label()
 {
-    if (g_hwnd && g_hLabel && IsWindow(g_hLabel)) {
-        
-char msg[256];
-std::snprintf(msg, sizeof(msg),
-    (g_last_label[0] ? "%s" : "no match (LO=%ld Hz, rows=%d)"),
-    g_last_label, g_lo, g_table_count);
-set_label_text(g_hLabel, msg);
+    if (!g_hwnd || !g_hLabel || !IsWindow(g_hLabel)) return;
 
+    // Diagnostický text: názov (alebo no match), LO, TUNE, počet riadkov, najbližšia zhoda a delta (±100 kHz)
+    char msg[256];
+    if (g_last_label[0]) {
+        std::snprintf(msg, sizeof(msg),
+            "%s  |  LO=%ld Hz  TUNE=%ld Hz  rows=%d  match=%ld  d=%ld (±100 kHz)",
+            g_last_label, g_lo, g_last_tune, g_table_count,
+            g_last_match, (g_last_match ? std::labs(g_last_match - (g_last_tune ? g_last_tune : g_lo)) : 0L));
+    } else {
+        std::snprintf(msg, sizeof(msg),
+            "no match  |  LO=%ld Hz  TUNE=%ld Hz  rows=%d  (±100 kHz)",
+            g_lo, g_last_tune, g_table_count);
     }
+    set_label_text(g_hLabel, msg);
 }
 
 // ---------- Povinné/štandardné exporty ExtIO ----------
@@ -268,7 +283,7 @@ __declspec(dllexport) bool __stdcall InitHW(char* name, char* model, int& type)
 
 __declspec(dllexport) bool __stdcall OpenHW(void)
 {
-    load_csv_labels();            // ignorujeme chyby – len nezobrazíme názvy
+    load_csv_labels();            // ak zlyhá, len nezobrazíme názvy
     return true;
 }
 
@@ -283,8 +298,10 @@ __declspec(dllexport) void __stdcall CloseHW(void)
 __declspec(dllexport) int __stdcall StartHW(long LOfreq)
 {
     g_lo = LOfreq;
-    g_running = true;
+    g_running   = true;
+    g_last_tune = 0;
     update_last_label_for(g_lo);
+    ensure_gui();
     refresh_gui_label();
     return 1024; // IQ páry (>=512; násobok 512)
 }
@@ -314,7 +331,7 @@ __declspec(dllexport) long __stdcall GetHWLO(void)
 
 __declspec(dllexport) long __stdcall GetHWSR(void)
 {
-    return 2400000; // 2.4 MS/s – dočasné, kým nepridáme reálne RTL-SDR
+    return 2400000; // 2.4 MS/s – dočasne, kým nepridáme reálne RTL-SDR
 }
 
 __declspec(dllexport) int __stdcall GetStatus(void)
@@ -331,6 +348,7 @@ __declspec(dllexport) void __stdcall ShowGUI(void)
 
 __declspec(dllexport) void __stdcall TuneChanged(long freq)
 {
+    g_last_tune = freq;
     update_last_label_for(freq);
     refresh_gui_label();
 }

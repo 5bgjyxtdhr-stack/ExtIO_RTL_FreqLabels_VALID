@@ -2,17 +2,20 @@
 // ExtIO RTL-FreqLabels: CSV lookup (±10 kHz) + jednoduché GUI okno so statickým textom
 // Rozhranie Winrad/ExtIO: extern "C", __stdcall, __declspec(dllexport)
 
+
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <cctype>
-#include <cmath>     // llround
+#include <cmath>
+#include <algorithm>
 
+#ifndef NOMINMAX
+#define NOMINMAX   // zabráni makrám min/max z windows.h rozbiť std::min/std::max
+#endif
 #include <windows.h>
 #pragma comment(lib, "user32.lib")
 
-#define NAME_MAX   64
-#define MODEL_MAX  64
 
 extern "C" {
 
@@ -54,7 +57,12 @@ static long parse_freq_to_hz(const char* s)
 {
     if (!s || !*s) return 0;
     char buf[64];
-    std::size_t n = std::min(std::strlen(s), sizeof(buf)-1);
+    
+// namiesto: std::size_t n = std::min(std::strlen(s), sizeof(buf)-1);
+std::size_t sl = std::strlen(s);
+std::size_t n  = (sl < sizeof(buf)-1 ? sl : sizeof(buf)-1);
+std::memcpy(buf, s, n); buf[n] = '\0';
+
     std::memcpy(buf, s, n); buf[n] = '\0';
 
     // nahradiť , -> . (EUR formát desatinných miest)

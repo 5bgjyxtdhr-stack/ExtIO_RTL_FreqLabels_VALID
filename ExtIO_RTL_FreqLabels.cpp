@@ -1,356 +1,246 @@
 
-// ExtIO RTL-FreqLabels: CSV lookup (±100 kHz) + jednoduché GUI so statickým textom
-// Rozhranie Winrad/ExtIO (HDSDR-kompatibilné): extern "C", __stdcall, __declspec(dllexport)
-
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
-#include <cctype>
-#include <cmath>
-#include <algorithm>
-
-#ifndef NOMINMAX
-#define NOMINMAX   // zabráni makrám min/max z <windows.h> rozbiť std::min/std::max
-#endif
+// ExtIO_RTL_FreqLabels.cpp
+#define WIN32_LEAN_AND_MEAN
 #include <windows.h>
-#pragma comment(lib, "user32.lib")
+#include <commctrl.h>
+#include <string>
+#include <vector>
+#include <fstream>
+#include <sstream>
+#include <algorithm>
+#include <mutex>
+#include <cmath>
 
-#define NAME_MAX   64
-#define MODEL_MAX  64
+struct LabelEntry {
+    double freq_hz;          // frekvencia v Hz (LO/Tune)
+    std::string name_utf8;   // UTF-8 text labelu (CSV)
+};
 
-extern "C" {
+static std::vector<LabelEntry> g_labels;
+static std::mutex g_mutex;
 
-// ---------- Typy a globálne premenné ----------
+static HWND g_hwndMain = nullptr;   // hlavné okno pluginu
+static HWND g_hwndText = nullptr;   // statický text vo vnútri
+static HFONT g_hFont = nullptr;
 
-typedef void (__stdcall *ExtIOHostCallback)(int, int, float, void*);
-
-static ExtIOHostCallback g_cb = nullptr;
-static long  g_lo        = 10000000;         // Hz
-static bool  g_running   = false;
-
-// CSV tabuľka
-struct FreqName { long hz; char name[128]; };
-static FreqName* g_table = nullptr;
-static int       g_table_count = 0;
-
-// Tolerancia pre zhodu (±100 kHz)
-static const long TOL_HZ = 100000;
-
-// Posledný nájdený názov + diagnostika
-static char g_last_label[128] = {0};
-static long g_last_tune  = 0;   // posledná TUNE frekvencia
-static long g_last_match = 0;   // frekvencia nájdená v tabuľke (Hz)
-
-// GUI
-static HWND g_hwnd   = nullptr;              // hlavné okno pluginu
-static HWND g_hLabel = nullptr;              // statický text vo vnútri
-
-// ---------- Pomocné funkcie (string/CSV) ----------
-
-static void copy_str(char* dst, const char* src, int maxLen)
-{
-    if (!dst || !src || maxLen <= 0) return;
-    int i = 0;
-    for (; i < maxLen - 1 && src[i] != '\0'; ++i) dst[i] = src[i];
-    dst[i] = '\0';
+// ===== Pomocné funkcie =====
+static std::wstring utf8_to_wstr(const std::string& s) {
+    if (s.empty()) return L"";
+    int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, nullptr, 0);
+    std::wstring ws(n, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, &ws[0], n);
+    if (!ws.empty() && ws.back() == L'\0') ws.pop_back();
+    return ws;
+}
+static void setTextUTF8(HWND h, const std::string& s) {
+    SetWindowTextW(h, utf8_to_wstr(s).c_str());
 }
 
-static char* trim(char* s)
-{
-    if (!s) return s;
-    while (*s && std::isspace((unsigned char)*s)) ++s;
-    if (!*s) return s;
-    char* e = s + std::strlen(s) - 1;
-    while (e > s && std::isspace((unsigned char)*e)) { *e = '\0'; --e; }
-    return s;
+static std::string getModuleDirA() {
+    char path[MAX_PATH]{0};
+    HMODULE hMod = nullptr;
+    GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                       GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                       (LPCSTR)&getModuleDirA, &hMod);
+    GetModuleFileNameA(hMod, path, MAX_PATH);
+    std::string s(path);
+    auto pos = s.find_last_of("\\/");
+    return (pos == std::string::npos) ? s : s.substr(0, pos);
 }
 
-// Prevedie reťazec na frekvenciu v Hz.
-// Ak je hodnota < 10000 => berieme to ako MHz a násobíme *1e6.
-// Ak obsahuje čiarku, prekonvertujeme ju na bodku.
-static long parse_freq_to_hz(const char* s)
-{
-    if (!s || !*s) return 0;
-    char buf[64];
-    std::size_t sl = std::strlen(s);
-    std::size_t n  = (sl < sizeof(buf)-1 ? sl : sizeof(buf)-1);
-    std::memcpy(buf, s, n); buf[n] = '\0';
+static bool loadLabelsCSV(const std::string& csvPath) {
+    std::ifstream f(csvPath, std::ios::binary);
+    if (!f.is_open()) return false;
 
-    for (char* p = buf; *p; ++p) if (*p == ',') *p = '.';
-
-    double v = 0.0;
-    if (std::sscanf(buf, "%lf", &v) != 1) return 0;
-
-    if (v < 10000.0) {
-        // pravdepodobne MHz
-        return (long)std::llround(v * 1e6);
-    } else {
-        // pravdepodobne Hz
-        return (long)std::llround(v);
-    }
-}
-
-static bool load_csv_labels()
-{
-    const char* up = ::getenv("USERPROFILE");
-    char path[512];
-    FILE* f = nullptr;
-
-    if (up) {
-        std::snprintf(path, sizeof(path), "%s\\Documents\\HDSDR\\freq_labels.csv", up);
-        f = std::fopen(path, "rb");
-    }
-    if (!f) {
-        // fallback – pohľadaj v aktuálnom priečinku (pri HDSDR.exe)
-        std::snprintf(path, sizeof(path), "freq_labels.csv");
-        f = std::fopen(path, "rb");
-    }
-    if (!f) return false;
-
-    const size_t LINE_MAX = 1024;
-    char line[LINE_MAX];
-
-    // preskoč hlavičku
-    if (!std::fgets(line, (int)LINE_MAX, f)) { std::fclose(f); return false; }
-
-    // spočítaj riadky
-    int rows = 0;
-    while (std::fgets(line, (int)LINE_MAX, f)) {
-        if (std::strchr(line, ',')) rows++;
-    }
-    if (rows <= 0) { std::fclose(f); return false; }
-
-    // alokácia
-    g_table = new FreqName[rows];
-    g_table_count = 0;
-
-    // načítanie
-    std::rewind(f);
-    std::fgets(line, (int)LINE_MAX, f); // hlavička
-    while (std::fgets(line, (int)LINE_MAX, f)) {
-        char* comma = std::strchr(line, ',');
-        if (!comma) continue;
-        *comma = '\0';
-        char* fstr = trim(line);
-        char* nstr = trim(comma + 1);
-
-        // odsekni CR/LF v názve
-        size_t ln = std::strlen(nstr);
-        while (ln && (nstr[ln - 1] == '\r' || nstr[ln - 1] == '\n')) { nstr[--ln] = '\0'; }
-
-        long hz = parse_freq_to_hz(fstr);
-        if (hz <= 0) continue;
-
-        g_table[g_table_count].hz = hz;
-        copy_str(g_table[g_table_count].name, nstr, (int)sizeof(g_table[g_table_count].name));
-        g_table_count++;
-    }
-    std::fclose(f);
-    return (g_table_count > 0);
-}
-
-static const char* find_label_for(long hz)
-{
-    g_last_match = 0;
-    if (!g_table || g_table_count <= 0) return nullptr;
-
-    // 1) presná zhoda
-    for (int i = 0; i < g_table_count; ++i) {
-        if (g_table[i].hz == hz) { g_last_match = g_table[i].hz; return g_table[i].name; }
-    }
-    // 2) ± tolerancia (krok 100 Hz)
-    for (long d = 0; d <= TOL_HZ; d += 100) {
-        long f1 = hz + d, f2 = hz - d;
-        for (int i = 0; i < g_table_count; ++i) {
-            if (g_table[i].hz == f1) { g_last_match = g_table[i].hz; return g_table[i].name; }
-            if (g_table[i].hz == f2) { g_last_match = g_table[i].hz; return g_table[i].name; }
+    std::string line;
+    // pokus o detekciu hlavičky
+    if (std::getline(f, line)) {
+        if (line.find("freq_hz") == std::string::npos) {
+            f.seekg(0);
         }
     }
-    // 3) najbližšia zhoda v rámci ± TOL_HZ
-    long bestDelta = TOL_HZ + 1;
-    int bestIdx = -1;
-    for (int i = 0; i < g_table_count; ++i) {
-        long d = std::labs(g_table[i].hz - hz);
-        if (d < bestDelta) { bestDelta = d; bestIdx = i; }
+
+    std::vector<LabelEntry> tmp;
+    while (std::getline(f, line)) {
+        if (line.empty()) continue;
+        char sep = (line.find(';') != std::string::npos) ? ';' : ',';
+        std::istringstream iss(line);
+        std::string freqStr, name;
+        if (!std::getline(iss, freqStr, sep)) continue;
+        if (!std::getline(iss, name)) name = "";
+        // trim
+        freqStr.erase(std::remove_if(freqStr.begin(), freqStr.end(), ::isspace), freqStr.end());
+        while (!name.empty() && (name.back() == '\r' || name.back() == '\n')) name.pop_back();
+
+        try {
+            double fHz = std::stod(freqStr);
+            if (fHz > 0 && !name.empty()) {
+                tmp.push_back({ fHz, name });
+            }
+        } catch (...) {
+            // skip
+        }
     }
-    if (bestIdx >= 0 && bestDelta <= TOL_HZ) {
-        g_last_match = g_table[bestIdx].hz;
-        return g_table[bestIdx].name;
-    }
-    return nullptr;
+    std::sort(tmp.begin(), tmp.end(), { return a.freq_hz < b.freq_hz; });
+
+    std::lock_guard<std::mutex> lk(g_mutex);
+    g_labels.swap(tmp);
+    return !g_labels.empty();
 }
 
-static void update_last_label_for(long hz)
-{
-    const char* lab = find_label_for(hz);
-    if (lab) copy_str(g_last_label, lab, (int)sizeof(g_last_label));
-    else     g_last_label[0] = '\0';
-}
-
-// ---------- GUI (Win32) ----------
-
-static void set_label_text(HWND h, const char* txt)
-{
-    // CSV je v UTF-8; pre konverziu na UTF-16 použijeme MultiByteToWideChar
-    wchar_t wbuf[256];
-    const char* src = (txt && txt[0]) ? txt : "(no match)";
-    int n = MultiByteToWideChar(CP_UTF8, 0, src, -1, wbuf, (int)(sizeof(wbuf)/sizeof(wbuf[0])));
-    if (n <= 0) {
-        // fallback – ANSI
-        size_t i=0; for (; i < (sizeof(wbuf)/sizeof(wbuf[0])) - 1 && src[i]; ++i) wbuf[i] = (unsigned char)src[i];
-        wbuf[i] = L'\0';
+// presná zhoda / tolerancia (default 5 kHz)
+static std::string findLabel(double tunedHz, double toleranceHz = 5000.0, bool roundAirband = true) {
+    std::lock_guard<std::mutex> lk(g_mutex);
+    // voliteľné: zaokrúhlenie na airband raster 8.33 kHz
+    if (roundAirband) {
+        // 8.33 kHz ≈ 8333.333 Hz
+        const double step = 8333.333;
+        tunedHz = std::round(tunedHz / step) * step;
     }
-    SetWindowTextW(h, wbuf);
+    auto it = std::lower_bound(g_labels.begin(), g_labels.end(), tunedHz,
+        { return e.freq_hz < v; });
+
+    auto best = std::string{};
+    auto check = &{
+        if (iter != g_labels.end()) {
+            double df = std::abs(iter->freq_hz - tunedHz);
+            if (df <= toleranceHz) best = iter->name_utf8;
+        }
+    };
+    check(it);
+    if (best.empty() && it != g_labels.begin()) check(std::prev(it));
+    return best;
 }
 
-static LRESULT CALLBACK GuiWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
-{
-    switch (msg) {
-    case WM_CREATE:
-        g_hLabel = CreateWindowExW(
-            0, L"STATIC", L"",
-            WS_CHILD | WS_VISIBLE | SS_LEFT,
-            10, 10, 560, 28,
-            hwnd, (HMENU)1, (HINSTANCE)GetWindowLongPtr(hwnd, GWLP_HINSTANCE), nullptr);
-        return 0;
+// ===== GUI =====
+static LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    switch (m) {
+        case WM_CREATE: {
+            g_hwndText = CreateWindowExW(0, L"STATIC", L"—",
+                WS_CHILD | WS_VISIBLE, 10, 10, 560, 40, h, nullptr,
+                (HINSTANCE)GetWindowLongPtr(h, GWLP_HINSTANCE), nullptr);
 
-    case WM_CLOSE:
-        ShowWindow(hwnd, SW_HIDE);   // len skryjeme okno
-        return 0;
-
-    case WM_DESTROY:
-        g_hwnd = nullptr;
-        g_hLabel = nullptr;
-        return 0;
+            if (!g_hFont) {
+                g_hFont = CreateFontW(
+                    24, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
+                    DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                    CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+            }
+            if (g_hFont) SendMessageW(g_hwndText, WM_SETFONT, (WPARAM)g_hFont, TRUE);
+            return 0;
+        }
+        case WM_CLOSE:
+            ShowWindow(h, SW_HIDE); // iba skryť
+            return 0;
+        case WM_DESTROY:
+            if (g_hFont) { DeleteObject(g_hFont); g_hFont = nullptr; }
+            g_hwndText = nullptr;
+            g_hwndMain = nullptr;
+            return 0;
     }
-    return DefWindowProcW(hwnd, msg, wParam, lParam);
+    return DefWindowProcW(h, m, w, l);
 }
 
-static void ensure_gui()
-{
-    if (g_hwnd && IsWindow(g_hwnd)) return;
-
-    WNDCLASSEXW wc = { 0 };
-    wc.cbSize        = sizeof(wc);
-    wc.style         = CS_DBLCLKS | CS_HREDRAW | CS_VREDRAW;
-    wc.lpfnWndProc   = GuiWndProc;
-    wc.hInstance     = (HINSTANCE)GetModuleHandleW(nullptr);
+static void ensureWindow() {
+    if (g_hwndMain) return;
+    const wchar_t* cls = L"ExtIO_FreqLabelsWnd";
+    WNDCLASSW wc{};
+    wc.style         = CS_HREDRAW | CS_VREDRAW;
+    wc.lpfnWndProc   = WndProc;
+    wc.hInstance     = GetModuleHandleW(nullptr);
     wc.hCursor       = LoadCursor(nullptr, IDC_ARROW);
-    wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
-    wc.lpszClassName = L"ExtIO_RTL_FreqLabels_Class";
-    RegisterClassExW(&wc);
+    wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    wc.lpszClassName = cls;
+    RegisterClassW(&wc);
 
-    g_hwnd = CreateWindowExW(
-        WS_EX_TOOLWINDOW, wc.lpszClassName, L"ExtIO RTL-FreqLabels",
+    g_hwndMain = CreateWindowExW(
+        WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+        cls, L"FreqLabels",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
-        CW_USEDEFAULT, CW_USEDEFAULT, 640, 140,
+        100, 100, 600, 120,
         nullptr, nullptr, wc.hInstance, nullptr);
 
-    if (g_hwnd) {
-        ShowWindow(g_hwnd, SW_SHOWNOACTIVATE);
-        UpdateWindow(g_hwnd);
-    }
+    ShowWindow(g_hwndMain, SW_SHOWNORMAL);
+    UpdateWindow(g_hwndMain);
 }
 
-static void refresh_gui_label()
-{
-    if (!g_hwnd || !g_hLabel || !IsWindow(g_hLabel)) return;
-
-    // Diagnostický text: názov (alebo no match), LO, TUNE, počet riadkov, najbližšia zhoda a delta (±100 kHz)
-    char msg[256];
-    if (g_last_label[0]) {
-        std::snprintf(msg, sizeof(msg),
-            "%s  |  LO=%ld Hz  TUNE=%ld Hz  rows=%d  match=%ld  d=%ld (±100 kHz)",
-            g_last_label, g_lo, g_last_tune, g_table_count,
-            g_last_match, (g_last_match ? std::labs(g_last_match - (g_last_tune ? g_last_tune : g_lo)) : 0L));
-    } else {
-        std::snprintf(msg, sizeof(msg),
-            "no match  |  LO=%ld Hz  TUNE=%ld Hz  rows=%d  (±100 kHz)",
-            g_lo, g_last_tune, g_table_count);
+static void updateLabelUI(const std::string& labelUtf8, double tunedHz = 0.0) {
+    if (!g_hwndMain) return;
+    std::wstring header = L"FreqLabels";
+    if (tunedHz > 0.0) {
+        wchar_t buf[128];
+        swprintf(buf, 128, L"FreqLabels — %.3f MHz", tunedHz / 1e6);
+        header = buf;
     }
-    set_label_text(g_hLabel, msg);
+    SetWindowTextW(g_hwndMain, header.c_str());
+    setTextUTF8(g_hwndText ? g_hwndText : g_hwndMain,
+                labelUtf8.empty() ? std::string("—") : labelUtf8);
 }
 
-// ---------- Povinné/štandardné exporty ExtIO ----------
+// ===== ExtIO exports (Winrad/HDSDR) =====
+extern "C" {
 
-__declspec(dllexport) bool __stdcall InitHW(char* name, char* model, int& type)
-{
-    copy_str(name,  "RTL-SDR",        32);
-    copy_str(model, "RTL-FreqLabels", 64);
-    type = 7; // 32-bit float IQ
+// Pozn.: konvencie __stdcall + extern "C" vyžaduje ExtIO špecifikácia. [1](https://github.com/rtlsdrblog/ExtIO_RTL/)
+__declspec(dllexport) bool __stdcall InitHW(char* name, char* model, int& type) {
+    // zobrazované v HDSDR menu / titulku
+    strcpy_s(name, 64, "RTL FreqLabels");
+    strcpy_s(model, 64, "AIR");
+
+    // typ: ak ovládaš len LO/tune (bez vlastného streamu), použije sa 4 (sound card path)
+    type = 4;  // podľa Winrad/ExtIO spec (pozri "type" v InitHW). [1](https://github.com/rtlsdrblog/ExtIO_RTL/)
+
+    const std::string csv = getModuleDirA() + "\\\\freq_labels.csv";
+    loadLabelsCSV(csv); // ak chýba, UI zobrazí "—"
     return true;
 }
 
-__declspec(dllexport) bool __stdcall OpenHW(void)
-{
-    load_csv_labels();            // ak zlyhá, len nezobrazíme názvy
+__declspec(dllexport) bool __stdcall OpenHW(void) {
     return true;
 }
 
-__declspec(dllexport) void __stdcall CloseHW(void)
-{
-    if (g_table) { delete[] g_table; g_table = nullptr; }
-    g_table_count = 0;
-    if (g_hwnd && IsWindow(g_hwnd)) DestroyWindow(g_hwnd);
-    g_hwnd = nullptr; g_hLabel = nullptr;
+__declspec(dllexport) void __stdcall CloseHW(void) {
+    if (g_hwndMain) DestroyWindow(g_hwndMain);
 }
 
-__declspec(dllexport) int __stdcall StartHW(long LOfreq)
-{
-    g_lo = LOfreq;
-    g_running   = true;
-    g_last_tune = 0;
-    update_last_label_for(g_lo);
-    ensure_gui();
-    refresh_gui_label();
-    return 1024; // IQ páry (>=512; násobok 512)
+__declspec(dllexport) int  __stdcall StartHW(long freq) {
+    // Ak by DLL posielala IQ cez callback, vrátiš veľkosť bloku (>=512).
+    // Keďže tu len riadime a zobrazujeme label, hodnota sa nevyužije.
+    return 512;  // kompatibilne s Winrad/ExtIO požiadavkou. [1](https://github.com/rtlsdrblog/ExtIO_RTL/)
 }
 
-__declspec(dllexport) void __stdcall StopHW(void)
-{
-    g_running = false;
-}
+__declspec(dllexport) void __stdcall StopHW(void) {}
 
-__declspec(dllexport) void __stdcall SetCallback(ExtIOHostCallback cb)
-{
-    g_cb = cb;
-}
-
-__declspec(dllexport) int __stdcall SetHWLO(long LOfreq)
-{
-    g_lo = LOfreq;
-    update_last_label_for(g_lo);
-    refresh_gui_label();
+// Hlavný hook: pri každej zmene LO
+__declspec(dllexport) int __stdcall SetHWLO(long LOfreq) {
+    ensureWindow();
+    const double tuned = static_cast<double>(LOfreq);
+    const std::string lbl = findLabel(tuned, /*toleranceHz*/ 5000.0, /*roundAirband*/ true);
+    updateLabelUI(lbl, tuned);
     return 0; // OK
 }
 
-__declspec(dllexport) long __stdcall GetHWLO(void)
-{
-    return g_lo;
+// Voliteľne: reagovať na zmenu "Tune" (nie iba LO)
+__declspec(dllexport) void __stdcall TuneChanged(long freq) {
+    ensureWindow();
+    const double tuned = static_cast<double>(freq);
+    const std::string lbl = findLabel(tuned, /*toleranceHz*/ 5000.0, /*roundAirband*/ true);
+    updateLabelUI(lbl, tuned);
 }
 
-__declspec(dllexport) long __stdcall GetHWSR(void)
-{
-    return 2400000; // 2.4 MS/s – dočasne, kým nepridáme reálne RTL-SDR
+__declspec(dllexport) long __stdcall GetHWLO(void) {
+    return 0; // (ak si LO držíš v globále, vráť aktuálnu)
 }
 
-__declspec(dllexport) int __stdcall GetStatus(void)
-{
-    return g_running ? 0 : 1; // 0 = OK
+// Musí existovať (HDSDR kontroluje prítomnosť), aj keď je "dummy". [1](https://github.com/rtlsdrblog/ExtIO_RTL/)
+__declspec(dllexport) int __stdcall GetStatus(void) { return 0; }
+
+__declspec(dllexport) void __stdcall ShowGUI(void) {
+    ensureWindow();
+    ShowWindow(g_hwndMain, SW_SHOWNORMAL);
 }
 
-__declspec(dllexport) void __stdcall ShowGUI(void)
-{
-    ensure_gui();                // vytvorí/ukáže okno
-    refresh_gui_label();         // nastaví text podľa posledného lookupu
-    if (g_hwnd) ShowWindow(g_hwnd, SW_SHOWNORMAL);
-}
-
-__declspec(dllexport) void __stdcall TuneChanged(long freq)
-{
-    g_last_tune = freq;
-    update_last_label_for(freq);
-    refresh_gui_label();
+__declspec(dllexport) void __stdcall HideGUI(void) {
+    if (g_hwndMain) ShowWindow(g_hwndMain, SW_HIDE);
 }
 
 } // extern "C"

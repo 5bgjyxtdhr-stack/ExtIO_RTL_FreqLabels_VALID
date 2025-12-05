@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cctype>
+#include <cstdlib>   // pre ::getenv
 
 // Pomocné maximum dĺžok
 #define NAME_MAX  64
@@ -56,7 +57,7 @@ static char* trim(char* s)
 static bool load_csv_labels()
 {
     // Zložíme cestu: %USERPROFILE%\Documents\HDSDR\freq_labels.csv
-    char* up = std::getenv("USERPROFILE");
+    const char* up = ::getenv("USERPROFILE");  // MSVC: getenv je v global namespace
     if (!up) return false;
 
     char path[512];

@@ -1,3 +1,4 @@
+
 LIBRARY ExtIO_RTL_FreqLabels
 EXPORTS
     InitHW=_InitHW@12
@@ -8,6 +9,7 @@ EXPORTS
     SetCallback=_SetCallback@4
     SetHWLO=_SetHWLO@4
     GetHWLO=_GetHWLO@0
+    GetHWSR=_GetHWSR@0     ; <— NOVÉ
     GetStatus=_GetStatus@0
     ShowGUI=_ShowGUI@0
     TuneChanged=_TuneChanged@4
